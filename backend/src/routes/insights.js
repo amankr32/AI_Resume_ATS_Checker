@@ -4,7 +4,7 @@ const asyncHandler = require("../utils/asyncHandler");
 const { requireAuth } = require("../middleware/auth");
 
 const Resume = require("../models/Resume");
-const ResumeVersion = require("../models/ResumeVersion");
+const ResumeVersion = require("../models/resumeVersion");
 const Analysis = require("../models/Analysis");
 
 const router = express.Router();

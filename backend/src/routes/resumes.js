@@ -9,7 +9,7 @@ const { validate } = require("../middleware/validate");
 const { uploadPdf } = require("../middleware/upload");
 
 const Resume = require("../models/Resume");
-const ResumeVersion = require("../models/ResumeVersion");
+const ResumeVersion = require("../models/resumeVersion");
 
 const { analyzeLimiter } = require("../middleware/rateLimit");
 const Analysis = require("../models/Analysis");
@@ -166,7 +166,7 @@ router.delete(
 
     await Analysis.deleteMany({ resumeId: resume._id });
 
-    await resume.deleteOne( { resumeId: resume._id } );
+    await resume.deleteOne();
 
     res.json({
       ok: true,

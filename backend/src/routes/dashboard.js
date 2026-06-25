@@ -1,245 +1,256 @@
-const router = require("./resumes");
+const express = require("express");
 
-const latestResumeMeta = resumes[0] || null;
+const asyncHandler = require("../utils/asyncHandler");
+const { requireAuth } = require("../middleware/auth");
 
-let latestResume = null;
-let scoreSeries = [];
-let versionStack = [];
+const Resume = require("../models/Resume");
+const ResumeVersion = require("../models/resumeVersion");
+const Analysis = require("../models/Analysis");
 
-if (latestResumeMeta) {
-  const versions = await ResumeVersion.find({
-    resumeId: latestResumeMeta._id,
-  })
-    .sort({ versionNumber: 1 })
-    .lean();
+const router = express.Router();
 
-  const analysisIds = versions
-    .map((v) => v.latestAnalysisId)
-    .filter(Boolean);
+router.use(requireAuth);
 
-  const analyses = analysisIds.length
-    ? await Analysis.find({
-        _id: { $in: analysisIds },
+router.get(
+  "/",
+  asyncHandler(async (req, res) => {
+    const userId = req.user._id;
+
+    // ── fetch all user resumes ──────────────────────────────────────
+    const resumes = await Resume.find({ userId })
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    const resumeIds = resumes.map((r) => r._id);
+
+    const [analysisCount, rewriteCount] = await Promise.all([
+      Analysis.countDocuments({ userId }),
+      ResumeVersion.countDocuments({
+        resumeId: { $in: resumeIds },
+        sourceType: "rewrite",
+      }),
+    ]);
+
+    // ── latest resume with score series & version stack ────────────
+    const latestResumeMeta = resumes[0] || null;
+
+    let latestResume = null;
+    let scoreSeries = [];
+    let versionStack = [];
+
+    if (latestResumeMeta) {
+      const versions = await ResumeVersion.find({
+        resumeId: latestResumeMeta._id,
       })
-        .select("_id atsScore versionId createdAt")
-        .lean()
-    : [];
+        .sort({ versionNumber: 1 })
+        .lean();
 
-  const scoreByVersion = new Map(
-    analyses.map((a) => [
-      a.versionId.toString(),
-      a.atsScore,
-    ])
-  );
+      const analysisIds = versions
+        .map((v) => v.latestAnalysisId)
+        .filter(Boolean);
 
-  const versionsWithScores = versions.map((v) => ({
-    id: v._id,
-    label: v.label,
-    versionNumber: v.versionNumber,
-    sourceType: v.sourceType,
-    createdAt: v.createdAt,
-    score: scoreByVersion.get(v._id.toString()) ?? null,
-  }));
+      const analyses = analysisIds.length
+        ? await Analysis.find({ _id: { $in: analysisIds } })
+            .select("_id atsScore versionId createdAt")
+            .lean()
+        : [];
 
-  latestResume = {
-    _id: latestResumeMeta._id,
-    title: latestResumeMeta.title,
-    latestVersionNumber:
-      latestResumeMeta.latestVersionNumber,
-    updatedAt: latestResumeMeta.updatedAt,
-    currentVersionId:
-      latestResumeMeta.currentVersionId,
-  };
+      const scoreByVersion = new Map(
+        analyses.map((a) => [a.versionId.toString(), a.atsScore])
+      );
 
-  scoreSeries = versionsWithScores
-    .filter((v) => v.score != null)
-    .map((v) => ({
-      label: v.label,
-      score: v.score,
-      versionId: v.id,
-      at: v.createdAt,
-    }));
+      const versionsWithScores = versions.map((v) => ({
+        id: v._id,
+        label: v.label,
+        versionNumber: v.versionNumber,
+        sourceType: v.sourceType,
+        createdAt: v.createdAt,
+        score: scoreByVersion.get(v._id.toString()) ?? null,
+      }));
 
-  const last3 = versionsWithScores.slice(-3);
+      latestResume = {
+        _id: latestResumeMeta._id,
+        title: latestResumeMeta.title,
+        latestVersionNumber: latestResumeMeta.latestVersionNumber,
+        updatedAt: latestResumeMeta.updatedAt,
+        currentVersionId: latestResumeMeta.currentVersionId,
+      };
 
-  versionStack = last3.map((v, i, arr) => {
-    const prev = arr[i - 1];
+      scoreSeries = versionsWithScores
+        .filter((v) => v.score != null)
+        .map((v) => ({
+          label: v.label,
+          score: v.score,
+          versionId: v.id,
+          at: v.createdAt,
+        }));
 
-    const delta =
-      v.score != null && prev?.score != null
-        ? v.score - prev.score
-        : 0;
+      const last3 = versionsWithScores.slice(-3);
 
-    return {
-      id: v.id,
-      label: v.label,
-      title:
-        v.sourceType === "upload"
-          ? "Upload"
-          : v.sourceType === "rewrite"
-          ? "Rewrite pass"
-          : v.label,
-      score: v.score ?? 0,
-      delta,
+      versionStack = last3.map((v, i, arr) => {
+        const prev = arr[i - 1];
+        const delta =
+          v.score != null && prev?.score != null
+            ? v.score - prev.score
+            : 0;
+
+        return {
+          id: v.id,
+          label: v.label,
+          title:
+            v.sourceType === "upload"
+              ? "Upload"
+              : v.sourceType === "rewrite"
+              ? "Rewrite pass"
+              : v.label,
+          score: v.score ?? 0,
+          delta,
+        };
+      });
+    }
+
+    // ── KPIs ────────────────────────────────────────────────────────
+    const allAnalyses = await Analysis.find({ userId })
+      .select(
+        "atsScore keywordsPresent keywordsMissing issues createdAt resumeId"
+      )
+      .sort({ createdAt: 1 })
+      .lean();
+
+    const latestAnalysis = allAnalyses[allAnalyses.length - 1] || null;
+    const prevAnalysis = allAnalyses[allAnalyses.length - 2] || null;
+
+    const scoreSpark = allAnalyses.slice(-10).map((a) => ({ v: a.atsScore }));
+    const versionsSpark = resumes
+      .slice(0, 10)
+      .reverse()
+      .map((r) => ({ v: r.latestVersionNumber || 1 }));
+    const keywordsSpark = allAnalyses
+      .slice(-10)
+      .map((a) => ({ v: (a.keywordsPresent || []).length }));
+    const issuesSpark = allAnalyses
+      .slice(-10)
+      .map((a) => ({ v: (a.issues || []).length }));
+
+    const kpi = {
+      atsScore: {
+        value: latestAnalysis?.atsScore ?? null,
+        delta:
+          latestAnalysis && prevAnalysis
+            ? latestAnalysis.atsScore - prevAnalysis.atsScore
+            : null,
+        spark: scoreSpark,
+      },
+      versions: {
+        value: resumes.reduce(
+          (sum, r) => sum + (r.latestVersionNumber || 1),
+          0
+        ),
+        delta: null,
+        spark: versionsSpark,
+      },
+      issuesIdentified: {
+        value: latestAnalysis ? latestAnalysis.issues?.length || 0 : null,
+        delta:
+          latestAnalysis && prevAnalysis
+            ? (latestAnalysis.issues?.length || 0) -
+              (prevAnalysis.issues?.length || 0)
+            : null,
+        spark: issuesSpark,
+      },
+      keywordsMatched: {
+        value: latestAnalysis
+          ? latestAnalysis.keywordsPresent?.length || 0
+          : null,
+        total: latestAnalysis
+          ? (latestAnalysis.keywordsPresent?.length || 0) +
+            (latestAnalysis.keywordsMissing?.length || 0)
+          : null,
+        delta:
+          latestAnalysis && prevAnalysis
+            ? (latestAnalysis.keywordsPresent?.length || 0) -
+              (prevAnalysis.keywordsPresent?.length || 0)
+            : null,
+        spark: keywordsSpark,
+      },
     };
-  });
-}
 
-// KPIs derived from history
-const allAnalyses = await Analysis.find({ userId })
-  .select("atsScore keywordsPresent keywordsMissing issues createdAt resumeId")
-  .sort({ createdAt: 1 })
-  .lean();
+    // ── activity feed ───────────────────────────────────────────────
+    const resumeMap = new Map(resumes.map((r) => [r._id.toString(), r]));
 
-const latestAnalysis = allAnalyses[allAnalyses.length - 1] || null;
-const prevAnalysis = allAnalyses[allAnalyses.length - 2] || null;
+    const [recentVersions, recentAnalyses] = await Promise.all([
+      ResumeVersion.find({ resumeId: { $in: resumeIds } })
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .select("resumeId label versionNumber sourceType createdAt")
+        .lean(),
 
-const scoreSpark = allAnalyses.slice(-10).map((a) => ({ v: a.atsScore }));
-const versionsSpark = resumes
-  .slice(0, 10)
-  .reverse()
-  .map((r) => ({ v: r.latestVersionNumber || 1 }));
+      Analysis.find({ userId })
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .select("resumeId versionId atsScore createdAt")
+        .lean(),
+    ]);
 
-const keywordsSpark = allAnalyses
-  .slice(-10)
-  .map((a) => ({ v: (a.keywordsPresent || []).length }));
+    const events = [];
 
-const issuesSpark = allAnalyses
-  .slice(-10)
-  .map((a) => ({ v: (a.issues || []).length }));
+    for (const r of resumes.slice(0, 10)) {
+      events.push({
+        id: `r-${r._id}`,
+        type: "upload",
+        title: `${r.title} uploaded`,
+        subtitle: "Parsed and version V1 created",
+        label: "V1",
+        at: r.createdAt,
+        resumeId: r._id,
+      });
+    }
 
-const kpi = {
-  atsScore: {
-    value: latestAnalysis?.atsScore ?? null,
-    delta:
-      latestAnalysis && prevAnalysis
-        ? latestAnalysis.atsScore - prevAnalysis.atsScore
-        : null,
-    spark: scoreSpark,
-  },
+    for (const v of recentVersions) {
+      if (v.sourceType !== "rewrite") continue;
+      const resume = resumeMap.get(v.resumeId.toString());
+      events.push({
+        id: `v-${v._id}`,
+        type: "rewrite",
+        title: `${v.label} created for ${resume?.title || "resume"}`,
+        subtitle: "Rewrites applied",
+        label: `${v.label} created`,
+        at: v.createdAt,
+        resumeId: v.resumeId,
+      });
+    }
 
-  versions: {
-    value: resumes.reduce(
-      (sum, r) => sum + (r.latestVersionNumber || 1),
-      0
-    ),
-    delta: null,
-    spark: versionsSpark,
-  },
+    for (const a of recentAnalyses) {
+      const resume = resumeMap.get(a.resumeId.toString());
+      events.push({
+        id: `a-${a._id}`,
+        type: "analyze",
+        title: `Analysis complete on ${resume?.title || "resume"}`,
+        subtitle: `ATS score ${a.atsScore} / 100`,
+        label: `${a.atsScore}`,
+        at: a.createdAt,
+        resumeId: a.resumeId,
+      });
+    }
 
-  issuesIdentified: {
-    value: latestAnalysis
-      ? latestAnalysis.issues?.length || 0
-      : null,
+    const activity = events
+      .sort((a, b) => new Date(b.at) - new Date(a.at))
+      .slice(0, 8);
 
-    delta:
-      latestAnalysis && prevAnalysis
-        ? (latestAnalysis.issues?.length || 0) -
-          (prevAnalysis.issues?.length || 0)
-        : null,
-
-    spark: issuesSpark,
-  },
-
-  keywordsMatched: {
-    value: latestAnalysis
-      ? latestAnalysis.keywordsPresent?.length || 0
-      : null,
-
-    total: latestAnalysis
-      ? (latestAnalysis.keywordsPresent?.length || 0) +
-        (latestAnalysis.keywordsMissing?.length || 0)
-      : null,
-
-    delta:
-      latestAnalysis && prevAnalysis
-        ? (latestAnalysis.keywordsPresent?.length || 0) -
-          (prevAnalysis.keywordsPresent?.length || 0)
-        : null,
-
-    spark: keywordsSpark,
-  },
-};
-
-const resumeMap = new Map(
-  resumes.map((r) => [r._id.toString(), r])
+    res.json({
+      totals: {
+        resumes: resumes.length,
+        rewrites: rewriteCount,
+        analyses: analysisCount,
+        exports: 0,
+      },
+      latestResume,
+      scoreSeries,
+      versionStack,
+      kpi,
+      activity,
+    });
+  })
 );
-
-const [recentVersions, recentAnalyses] = await Promise.all([
-  ResumeVersion.find({ resumeId: { $in: resumeIds } })
-    .sort({ createdAt: -1 })
-    .limit(10)
-    .select("resumeId label versionNumber sourceType createdAt")
-    .lean(),
-
-  Analysis.find({ userId })
-    .sort({ createdAt: -1 })
-    .limit(10)
-    .select("resumeId versionId atsScore createdAt")
-    .lean(),
-]);
-
-const events = [];
-
-for (const r of resumes.slice(0, 10)) {
-  events.push({
-    id: `r-${r._id}`,
-    type: "upload",
-    title: `${r.title} uploaded`,
-    subtitle: "Parsed and version V1 created",
-    label: "V1",
-    at: r.createdAt,
-    resumeId: r._id,
-  });
-}
-
-for (const v of recentVersions) {
-  if (v.sourceType !== "rewrite") continue;
-
-  const resume = resumeMap.get(v.resumeId.toString());
-
-  events.push({
-    id: `v-${v._id}`,
-    type: "rewrite",
-    title: `${v.label} created for ${resume?.title || "resume"}`,
-    subtitle: "Rewrites applied",
-    label: `${v.label} created`,
-    at: v.createdAt,
-    resumeId: v.resumeId,
-  });
-}
-
-for (const a of recentAnalyses) {
-  const resume = resumeMap.get(a.resumeId.toString());
-
-  events.push({
-    id: `a-${a._id}`,
-    type: "analyze",
-    title: `Analysis complete on ${resume?.title || "resume"}`,
-    subtitle: `ATS score ${a.atsScore} / 100`,
-    label: `${a.atsScore}`,
-    at: a.createdAt,
-    resumeId: a.resumeId,
-  });
-}
-
-const activity = events
-  .sort((a, b) => new Date(b.at) - new Date(a.at))
-  .slice(0, 8);
-
-res.json({
-  totals: {
-    resumes: resumes.length,
-    rewrites: rewriteCount,
-    analyses: analysisCount,
-    exports: 0,
-  },
-
-  latestResume,
-  scoreSeries,
-  versionStack,
-  kpi,
-  activity,
-});
 
 module.exports = router;
